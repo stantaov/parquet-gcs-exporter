@@ -1,0 +1,79 @@
+apiVersion: bindplane.observiq.com/v1
+kind: DestinationType
+metadata:
+  name: parquet-gcs-storage
+  displayName: Parquet GCS Storage
+  description: >
+    Exports logs as Parquet files to Google Cloud Storage.
+    Each field in the log body becomes a column. Files are
+    partitioned by time and uploaded on a configurable batch
+    size or timeout, whichever comes first.
+spec:
+  parameters:
+    # ── GCS ──────────────────────────────────────────────────
+    - name: bucket
+      label: GCS Bucket Name
+      description: Name of the destination GCS bucket.
+      type: string
+      required: true
+
+    - name: project_id
+      label: GCP Project ID
+      description: >
+        GCP project that owns the bucket.
+        Leave empty to use Application Default Credentials project.
+      type: string
+      required: false
+      default: ""
+
+    - name: prefix
+      label: Object Prefix
+      description: >
+        Path prefix prepended to every object, e.g. "wsa/raw".
+        Do not include a trailing slash.
+      type: string
+      default: logs
+
+    - name: partition_format
+      label: Partition Format
+      description: >
+        Go time-format string for the partition sub-path appended after the
+        prefix. Uses the Go reference time (2006=year, 01=month, 02=day, 15=hour).
+        Example: year=2006/month=01/day=02/hour=15
+      type: string
+      default: "year=2006/month=01/day=02"
+
+    # ── Batching (controls file size / freshness) ─────────────
+    - name: batch_size
+      label: Records per File
+      description: >
+        Flush and write a new Parquet file after this many log records.
+        Larger values = bigger files, fewer GCS objects.
+      type: int
+      default: 50000
+
+    - name: batch_timeout
+      label: Flush Timeout
+      description: >
+        Flush after this duration even if batch_size has not been reached.
+        Ensures files are written during low-volume periods.
+        Format: Go duration string, e.g. 5m, 30s.
+      type: string
+      default: 5m
+
+  template: |
+    processors:
+      batch/parquet_gcs:
+        send_batch_size: {{ .batch_size }}
+        timeout: {{ .batch_timeout }}
+    exporters:
+      parquetgcsstorage:
+        {{ if .project_id }}project_id: "{{ .project_id }}"{{ end }}
+        bucket: "{{ .bucket }}"
+        prefix: "{{ .prefix }}"
+        partition_format: "{{ .partition_format }}"
+    service:
+      pipelines:
+        logs:
+          processors: [batch/parquet_gcs]
+          exporters: [parquetgcsstorage]
