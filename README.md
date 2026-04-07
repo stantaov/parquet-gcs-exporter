@@ -179,6 +179,30 @@ OPTIONS (
 
 A BindPlane destination type is included in `bindplane/destination-type.yaml`. Import it to enable UI-driven configuration of the exporter within BindPlane.
 
+## CI/CD
+
+### PR Checks (`ci.yml`)
+
+Triggers on **pull requests** to `main`. Runs two parallel jobs:
+- **build-and-test** — `go build ./...` and `go test -v -race`
+- **lint** — `golangci-lint`
+
+Both must pass before merging.
+
+### Tag-Based Releases (`release.yml`)
+
+Triggers when you push a `v*` tag:
+
+```bash
+git tag v1.0.2
+git push origin v1.0.2
+```
+
+1. Runs build + tests to validate the tagged code
+2. If tests pass, creates a **GitHub Release** with:
+   - Auto-generated changelog (commit messages since previous tag)
+   - Installation snippet with the exact tag version
+
 ## Component Metadata
 
 | Property | Value |
