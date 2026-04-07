@@ -17,8 +17,11 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 	"google.golang.org/api/option"
+
+	"github.com/stantaov/parquet-gcs-exporter/internal/metadata"
 )
 
 // clientMaxAge controls how long a cached GCS client is reused before being
@@ -51,13 +54,57 @@ type parquetGCSExporter struct {
 	mu              sync.Mutex
 	client          *storage.Client
 	clientCreatedAt time.Time
+
+	// metrics
+	recordsExported metric.Int64Counter
+	recordsSkipped  metric.Int64Counter
+	uploadBytes     metric.Int64Counter
+	uploadDuration  metric.Int64Histogram
 }
 
-func newExporter(cfg *Config, logger *zap.Logger) *parquetGCSExporter {
-	return &parquetGCSExporter{
-		config: cfg,
-		logger: logger,
+func newExporter(cfg *Config, logger *zap.Logger, mp metric.MeterProvider) (*parquetGCSExporter, error) {
+	meter := mp.Meter(metadata.ScopeName)
+
+	recordsExported, err := meter.Int64Counter("parquetgcsstorage.records.exported",
+		metric.WithDescription("Number of log records written to Parquet files"),
+		metric.WithUnit("{records}"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create records.exported metric: %w", err)
 	}
+
+	recordsSkipped, err := meter.Int64Counter("parquetgcsstorage.records.skipped",
+		metric.WithDescription("Number of log records skipped due to non-map body"),
+		metric.WithUnit("{records}"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create records.skipped metric: %w", err)
+	}
+
+	uploadBytes, err := meter.Int64Counter("parquetgcsstorage.upload.bytes",
+		metric.WithDescription("Total bytes uploaded to GCS"),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create upload.bytes metric: %w", err)
+	}
+
+	uploadDuration, err := meter.Int64Histogram("parquetgcsstorage.upload.duration",
+		metric.WithDescription("GCS upload duration"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create upload.duration metric: %w", err)
+	}
+
+	return &parquetGCSExporter{
+		config:          cfg,
+		logger:          logger,
+		recordsExported: recordsExported,
+		recordsSkipped:  recordsSkipped,
+		uploadBytes:     uploadBytes,
+		uploadDuration:  uploadDuration,
+	}, nil
 }
 
 func (e *parquetGCSExporter) start(_ context.Context, _ component.Host) error {
@@ -114,7 +161,13 @@ func (e *parquetGCSExporter) getClient(ctx context.Context) (*storage.Client, er
 }
 
 func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) error {
-	records := extractBodyMaps(ld)
+	records, skipped := extractBodyMaps(ld)
+
+	if skipped > 0 {
+		e.logger.Debug("skipped log records with non-map bodies", zap.Int("skipped", skipped))
+		e.recordsSkipped.Add(ctx, int64(skipped))
+	}
+
 	if len(records) == 0 {
 		return nil
 	}
@@ -127,9 +180,16 @@ func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) erro
 	}
 
 	objectPath := e.objectPath()
+
+	uploadStart := time.Now()
 	if err := e.upload(ctx, objectPath, buf); err != nil {
 		return fmt.Errorf("failed to upload gs://%s/%s: %w", e.config.Bucket, objectPath, err)
 	}
+	uploadMs := time.Since(uploadStart).Milliseconds()
+
+	e.recordsExported.Add(ctx, int64(len(records)))
+	e.uploadBytes.Add(ctx, int64(len(buf)))
+	e.uploadDuration.Record(ctx, uploadMs)
 
 	e.logger.Info("uploaded parquet file",
 		zap.String("bucket", e.config.Bucket),
@@ -137,14 +197,17 @@ func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) erro
 		zap.Int("records", len(records)),
 		zap.Int("columns", len(keys)),
 		zap.Int("bytes", len(buf)),
+		zap.Int64("upload_ms", uploadMs),
 	)
 	return nil
 }
 
 // extractBodyMaps walks all log records and returns each body map with
-// preserved value types. Records whose body is not a map are skipped.
-func extractBodyMaps(ld plog.Logs) []map[string]typedValue {
+// preserved value types. Records whose body is not a map are counted as
+// skipped and excluded from the result.
+func extractBodyMaps(ld plog.Logs) ([]map[string]typedValue, int) {
 	var records []map[string]typedValue
+	var skipped int
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
 		for j := 0; j < rl.ScopeLogs().Len(); j++ {
@@ -152,6 +215,7 @@ func extractBodyMaps(ld plog.Logs) []map[string]typedValue {
 			for k := 0; k < sl.LogRecords().Len(); k++ {
 				lr := sl.LogRecords().At(k)
 				if lr.Body().Type() != pcommon.ValueTypeMap {
+					skipped++
 					continue
 				}
 				row := make(map[string]typedValue)
@@ -172,7 +236,7 @@ func extractBodyMaps(ld plog.Logs) []map[string]typedValue {
 			}
 		}
 	}
-	return records
+	return records, skipped
 }
 
 // inferSchema collects all unique keys across records and determines each

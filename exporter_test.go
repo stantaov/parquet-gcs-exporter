@@ -2,12 +2,15 @@ package parquetgcsexporter
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 )
 
@@ -25,7 +28,10 @@ func TestExtractBodyMaps_TypedValues(t *testing.T) {
 	m.PutDouble("latency", 1.5)
 	m.PutBool("ok", true)
 
-	records := extractBodyMaps(ld)
+	records, skipped := extractBodyMaps(ld)
+	if skipped != 0 {
+		t.Errorf("expected 0 skipped, got %d", skipped)
+	}
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
@@ -58,19 +64,43 @@ func TestExtractBodyMaps_SkipsNonMap(t *testing.T) {
 	lr2 := sl.LogRecords().AppendEmpty()
 	lr2.Body().SetEmptyMap().PutStr("key", "val")
 
-	records := extractBodyMaps(ld)
+	records, skipped := extractBodyMaps(ld)
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped, got %d", skipped)
+	}
 	if len(records) != 1 {
-		t.Fatalf("expected 1 record (non-map skipped), got %d", len(records))
+		t.Fatalf("expected 1 record, got %d", len(records))
 	}
 	if records[0]["key"].str != "val" {
 		t.Errorf("unexpected value: %+v", records[0]["key"])
 	}
 }
 
+func TestExtractBodyMaps_MultipleSkipped(t *testing.T) {
+	ld := plog.NewLogs()
+	rl := ld.ResourceLogs().AppendEmpty()
+	sl := rl.ScopeLogs().AppendEmpty()
+
+	// Three non-map bodies.
+	sl.LogRecords().AppendEmpty().Body().SetStr("line 1")
+	sl.LogRecords().AppendEmpty().Body().SetStr("line 2")
+	sl.LogRecords().AppendEmpty().Body().SetInt(42)
+
+	// One map body.
+	sl.LogRecords().AppendEmpty().Body().SetEmptyMap().PutStr("k", "v")
+
+	records, skipped := extractBodyMaps(ld)
+	if skipped != 3 {
+		t.Errorf("expected 3 skipped, got %d", skipped)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+}
+
 func TestExtractBodyMaps_MultipleResourceAndScopes(t *testing.T) {
 	ld := plog.NewLogs()
 
-	// Two resource logs, each with one scope log containing one record.
 	for i := 0; i < 2; i++ {
 		rl := ld.ResourceLogs().AppendEmpty()
 		sl := rl.ScopeLogs().AppendEmpty()
@@ -78,7 +108,10 @@ func TestExtractBodyMaps_MultipleResourceAndScopes(t *testing.T) {
 		lr.Body().SetEmptyMap().PutStr("src", "resource")
 	}
 
-	records := extractBodyMaps(ld)
+	records, skipped := extractBodyMaps(ld)
+	if skipped != 0 {
+		t.Errorf("expected 0 skipped, got %d", skipped)
+	}
 	if len(records) != 2 {
 		t.Fatalf("expected 2 records across resources, got %d", len(records))
 	}
@@ -86,7 +119,10 @@ func TestExtractBodyMaps_MultipleResourceAndScopes(t *testing.T) {
 
 func TestExtractBodyMaps_Empty(t *testing.T) {
 	ld := plog.NewLogs()
-	records := extractBodyMaps(ld)
+	records, skipped := extractBodyMaps(ld)
+	if skipped != 0 {
+		t.Errorf("expected 0 skipped, got %d", skipped)
+	}
 	if len(records) != 0 {
 		t.Fatalf("expected 0 records, got %d", len(records))
 	}
@@ -127,9 +163,9 @@ func TestInferSchema_MixedTypesFallbackToString(t *testing.T) {
 func TestInferSchema_SortedKeys(t *testing.T) {
 	records := []map[string]typedValue{
 		{
-			"zebra":    {vType: pcommon.ValueTypeStr},
-			"alpha":    {vType: pcommon.ValueTypeStr},
-			"middle":   {vType: pcommon.ValueTypeStr},
+			"zebra":  {vType: pcommon.ValueTypeStr},
+			"alpha":  {vType: pcommon.ValueTypeStr},
+			"middle": {vType: pcommon.ValueTypeStr},
 		},
 	}
 
@@ -241,8 +277,6 @@ func TestWriteParquet_AllStrings(t *testing.T) {
 }
 
 func TestWriteParquet_NullableColumns(t *testing.T) {
-	// Record 1 has "a" and "b"; record 2 only has "a".
-	// Column "b" should be null in record 2.
 	records := []map[string]typedValue{
 		{
 			"a": {vType: pcommon.ValueTypeStr, str: "x"},
@@ -269,7 +303,6 @@ func TestWriteParquet_NullableColumns(t *testing.T) {
 }
 
 func TestWriteParquet_MixedTypeFallback(t *testing.T) {
-	// "val" has int in record 1, string in record 2 → falls back to string column.
 	records := []map[string]typedValue{
 		{"val": {vType: pcommon.ValueTypeInt, i64: 42, str: "42"}},
 		{"val": {vType: pcommon.ValueTypeStr, str: "hello"}},
@@ -384,12 +417,52 @@ func TestConfigValidate_EmptyBucket(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_ValidPartitionFormat(t *testing.T) {
+	c := &Config{
+		Bucket:          "b",
+		PartitionFormat: "year=2006/month=01/day=02/hour=15",
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid partition format should not error: %v", err)
+	}
+}
+
+func TestConfigValidate_StaticPartitionFormat(t *testing.T) {
+	c := &Config{
+		Bucket:          "b",
+		PartitionFormat: "static-path",
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("static partition format should fail validation")
+	}
+}
+
+func TestConfigValidate_CredentialsFileExists(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "creds.json")
+	os.WriteFile(tmp, []byte(`{}`), 0644)
+
+	c := &Config{Bucket: "b", CredentialsFile: tmp}
+	if err := c.Validate(); err != nil {
+		t.Errorf("existing credentials file should not error: %v", err)
+	}
+}
+
+func TestConfigValidate_CredentialsFileMissing(t *testing.T) {
+	c := &Config{Bucket: "b", CredentialsFile: "/nonexistent/path/creds.json"}
+	if err := c.Validate(); err == nil {
+		t.Error("missing credentials file should fail validation")
+	}
+}
+
 // --- newExporter ---
 
 func TestNewExporter(t *testing.T) {
 	cfg := &Config{Bucket: "test"}
 	logger := zap.NewNop()
-	exp := newExporter(cfg, logger)
+	exp, err := newExporter(cfg, logger, noop.NewMeterProvider())
+	if err != nil {
+		t.Fatalf("newExporter: %v", err)
+	}
 
 	if exp.config != cfg {
 		t.Error("config mismatch")
@@ -399,5 +472,17 @@ func TestNewExporter(t *testing.T) {
 	}
 	if exp.client != nil {
 		t.Error("client should be nil initially")
+	}
+	if exp.recordsExported == nil {
+		t.Error("recordsExported metric should be initialized")
+	}
+	if exp.recordsSkipped == nil {
+		t.Error("recordsSkipped metric should be initialized")
+	}
+	if exp.uploadBytes == nil {
+		t.Error("uploadBytes metric should be initialized")
+	}
+	if exp.uploadDuration == nil {
+		t.Error("uploadDuration metric should be initialized")
 	}
 }

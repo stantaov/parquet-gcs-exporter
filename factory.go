@@ -32,7 +32,10 @@ func createDefaultConfig() component.Config {
 
 func createLogsExporter(ctx context.Context, set exporter.Settings, cfg component.Config) (exporter.Logs, error) {
 	c := cfg.(*Config)
-	exp := newExporter(c, set.Logger)
+	exp, err := newExporter(c, set.Logger, set.TelemetrySettings.MeterProvider)
+	if err != nil {
+		return nil, err
+	}
 	return exporterhelper.NewLogs(
 		ctx, set, cfg,
 		exp.consumeLogs,

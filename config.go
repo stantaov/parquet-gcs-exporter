@@ -2,6 +2,9 @@ package parquetgcsexporter
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"time"
 
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
@@ -40,5 +43,23 @@ func (c *Config) Validate() error {
 	if c.Bucket == "" {
 		return errors.New("bucket is required")
 	}
+
+	if c.PartitionFormat != "" {
+		// Go's time.Format never errors, so verify the format actually
+		// contains time-reference components by checking that two different
+		// timestamps produce different paths.
+		ref := time.Date(2006, 1, 2, 15, 4, 5, 0, time.UTC)
+		alt := time.Date(2007, 6, 15, 10, 30, 0, 0, time.UTC)
+		if ref.Format(c.PartitionFormat) == alt.Format(c.PartitionFormat) {
+			return fmt.Errorf("partition_format %q does not contain time-varying components", c.PartitionFormat)
+		}
+	}
+
+	if c.CredentialsFile != "" {
+		if _, err := os.Stat(c.CredentialsFile); err != nil {
+			return fmt.Errorf("credentials_file: %w", err)
+		}
+	}
+
 	return nil
 }
