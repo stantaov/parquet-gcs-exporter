@@ -5,41 +5,62 @@ metadata:
   displayName: Parquet GCS Storage
   description: >
     Exports logs as Parquet files to Google Cloud Storage.
-    Each field in the log body becomes a column. Files are
-    partitioned by time and uploaded on a configurable batch
-    size or timeout, whichever comes first.
+    Each field in the log body becomes a Parquet column, partitioned by time.
+    Files are written on a configurable batch size or timeout, whichever comes first.
 spec:
+  version: 0.1.0
   parameters:
-    # ── GCS ──────────────────────────────────────────────────
-    - name: bucket
-      label: GCS Bucket Name
-      description: Name of the destination GCS bucket.
+    - name: telemetry_types
+      label: Telemetry Types
+      description: Parquet GCS Storage supports Logs only.
+      type: telemetrySelector
+      validValues:
+        - Logs
+      default:
+        - Logs
+
+    # ── GCS ──────────────────────────────────────────────────────────────
+    - name: bucket_name
+      label: Bucket Name
+      description: Name of the destination GCS bucket. Must be globally unique.
       type: string
       required: true
+
+    - name: folder_name
+      label: Folder Name
+      description: >
+        An optional folder path prepended to every object, e.g. "wsa/raw".
+        Do not include a trailing slash.
+      type: string
+      default: logs
 
     - name: project_id
       label: GCP Project ID
       description: >
         GCP project that owns the bucket.
-        Leave empty to use Application Default Credentials project.
+        Leave empty to read from the credential file or Application Default Credentials.
       type: string
-      required: false
       default: ""
 
-    - name: prefix
-      label: Object Prefix
+    # ── Authentication ────────────────────────────────────────────────────
+    - name: credentials_file
+      label: Credentials File
       description: >
-        Path prefix prepended to every object, e.g. "wsa/raw".
-        Do not include a trailing slash.
+        Path to a Google credential file on the collector host.
+        Accepts a Service Account JSON key or a Workload Identity Federation (WIF)
+        external-credentials config file (e.g. /etc/security/wif/my-config.json).
+        Leave empty to use Application Default Credentials (ADC) — correct for GKE
+        with Workload Identity enabled.
       type: string
-      default: logs
+      default: ""
 
+    # ── Partitioning ──────────────────────────────────────────────────────
     - name: granularity
       label: Partition Granularity
       description: >
         Controls the GCS folder structure used for time partitioning.
         BigQuery uses these Hive-style paths for partition pruning on external tables.
-        "Hour" is recommended for security logs — fresh data with reasonable file sizes.
+        Hour is recommended for security logs — fresh data with reasonable file sizes.
       type: enum
       validValues:
         - day
@@ -47,116 +68,108 @@ spec:
         - minute
       default: hour
 
-    # ── Authentication ────────────────────────────────────────
-    - name: credentials_file
-      label: Credentials File
-      description: >
-        Path to a Google credential file on the collector host.
-        Accepts a Service Account JSON key or a Workload Identity Federation (WIF)
-        external-credentials config file (e.g. /etc/security/wif/my-config.json).
-        Leave empty to use Application Default Credentials (ADC), which is the
-        correct setting when running on GKE with Workload Identity enabled.
-      type: string
-      required: false
-      default: ""
-
-    # ── Batching (controls file size / freshness) ─────────────
+    # ── Batching ──────────────────────────────────────────────────────────
     - name: batch_size
       label: Records per File
       description: >
         Flush and write a new Parquet file after this many log records.
-        Larger values = bigger files, fewer GCS objects.
+        Larger values produce bigger files with fewer GCS objects.
       type: int
       default: 50000
+      advancedConfig: true
 
     - name: batch_timeout
       label: Flush Timeout
       description: >
-        Flush after this duration even if batch_size has not been reached.
+        Flush after this many seconds even if batch_size has not been reached.
         Ensures files are written during low-volume periods.
-        Format: Go duration string, e.g. 5m, 30s.
-      type: string
-      default: 5m
+      type: int
+      default: 300
+      advancedConfig: true
 
-    # ── Retry on failure ──────────────────────────────────────
-    - name: retry_enabled
+    # ── Retry on Failure ──────────────────────────────────────────────────
+    - name: retry_on_failure_enabled
       label: Enable Retry on Failure
       description: Retry failed exports with exponential back-off.
       type: bool
       default: true
+      advancedConfig: true
+      options:
+        sectionHeader: true
 
-    - name: retry_initial_interval
+    - name: retry_on_failure_initial_interval
       label: Initial Interval
-      description: Time to wait after the first failure before retrying (e.g. 5s).
-      type: string
-      default: "5s"
+      description: Time (in seconds) to wait after the first failure before retrying.
+      type: int
+      default: 5
       relevantIf:
-        - name: retry_enabled
+        - name: retry_on_failure_enabled
           operator: equals
           value: true
+      advancedConfig: true
 
-    - name: retry_max_interval
+    - name: retry_on_failure_max_interval
       label: Max Interval
-      description: Upper bound on retry back-off interval (e.g. 30s).
-      type: string
-      default: "30s"
+      description: Upper bound (in seconds) on retry back-off interval.
+      type: int
+      default: 30
       relevantIf:
-        - name: retry_enabled
+        - name: retry_on_failure_enabled
           operator: equals
           value: true
+      advancedConfig: true
 
-    - name: retry_max_elapsed_time
+    - name: retry_on_failure_max_elapsed_time
       label: Max Elapsed Time
-      description: Give up retrying after this total duration (e.g. 300s). 0 means never give up.
-      type: string
-      default: "300s"
+      description: >
+        Give up retrying after this total duration (in seconds).
+        Set to 0 to retry indefinitely.
+      type: int
+      default: 300
       relevantIf:
-        - name: retry_enabled
+        - name: retry_on_failure_enabled
           operator: equals
           value: true
+      advancedConfig: true
 
-    # ── Sending queue ─────────────────────────────────────────
-    - name: queue_enabled
+    # ── Sending Queue ─────────────────────────────────────────────────────
+    - name: sending_queue_enabled
       label: Enable Sending Queue
-      description: Buffer exports in an in-memory queue to decouple ingestion from GCS writes.
+      description: >
+        Buffer exports in an in-memory queue to decouple ingestion from GCS writes.
       type: bool
       default: true
+      advancedConfig: true
+      options:
+        sectionHeader: true
 
-    - name: queue_num_consumers
+    - name: sending_queue_num_consumers
       label: Number of Consumers
       description: Number of workers that dequeue and send batches concurrently.
       type: int
       default: 10
+      advancedConfig: true
 
-    - name: queue_size
+    - name: sending_queue_queue_size
       label: Queue Size
       description: Maximum number of batches held in memory before dropping.
       type: int
       default: 1000
+      advancedConfig: true
 
-  template: |
-    processors:
-      batch/parquet_gcs:
-        send_batch_size: {{ .batch_size }}
-        timeout: {{ .batch_timeout }}
-    exporters:
-      parquetgcsstorage:
-        {{ if .project_id }}project_id: "{{ .project_id }}"{{ end }}
-        {{ if .credentials_file }}credentials_file: "{{ .credentials_file }}"{{ end }}
-        bucket: "{{ .bucket }}"
-        prefix: "{{ .prefix }}"
-        partition_format: "{{ if eq .granularity "minute" }}year=2006/month=01/day=02/hour=15/minute=04{{ else if eq .granularity "hour" }}year=2006/month=01/day=02/hour=15{{ else }}year=2006/month=01/day=02{{ end }}"
-        retry_on_failure:
-          enabled: {{ .retry_enabled }}
-          initial_interval: {{ .retry_initial_interval }}
-          max_interval: {{ .retry_max_interval }}
-          max_elapsed_time: {{ .retry_max_elapsed_time }}
-        sending_queue:
-          enabled: {{ .queue_enabled }}
-          num_consumers: {{ .queue_num_consumers }}
-          queue_size: {{ .queue_size }}
-    service:
-      pipelines:
-        logs:
-          processors: [batch/parquet_gcs]
-          exporters: [parquetgcsstorage]
+  logs:
+    processors: |
+      - batch/parquet_gcs:
+          send_batch_size: {{ .batch_size }}
+          timeout: {{ bpRenderDurationInSeconds .batch_timeout }}
+    exporters: |
+      {{ if has "Logs" .telemetry_types }}
+      - parquetgcsstorage:
+          bucket: "{{ .bucket_name }}"
+          prefix: "{{ .folder_name }}"
+          {{ if .project_id }}project_id: "{{ .project_id }}"{{ end }}
+          {{ if .credentials_file }}credentials_file: "{{ .credentials_file }}"{{ end }}
+          partition_format: "{{ if eq .granularity "minute" }}year=2006/month=01/day=02/hour=15/minute=04{{ else if eq .granularity "hour" }}year=2006/month=01/day=02/hour=15{{ else }}year=2006/month=01/day=02{{ end }}"
+          {{ bpRenderOtelRetryOnFailureConfig .retry_on_failure_enabled .retry_on_failure_initial_interval .retry_on_failure_max_interval .retry_on_failure_max_elapsed_time }}
+          {{ bpRenderOtelSendingQueueConfig .sending_queue_enabled false "" .sending_queue_num_consumers .sending_queue_queue_size }}
+      {{ end }}
