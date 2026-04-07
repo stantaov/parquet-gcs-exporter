@@ -34,14 +34,31 @@ spec:
       type: string
       default: logs
 
-    - name: partition_format
-      label: Partition Format
+    - name: granularity
+      label: Partition Granularity
       description: >
-        Go time-format string for the partition sub-path appended after the
-        prefix. Uses the Go reference time (2006=year, 01=month, 02=day, 15=hour).
-        Example: year=2006/month=01/day=02/hour=15
+        Controls the GCS folder structure used for time partitioning.
+        BigQuery uses these Hive-style paths for partition pruning on external tables.
+        "Hour" is recommended for security logs — fresh data with reasonable file sizes.
+      type: enum
+      validValues:
+        - day
+        - hour
+        - minute
+      default: hour
+
+    # ── Authentication ────────────────────────────────────────
+    - name: credentials_file
+      label: Credentials File
+      description: >
+        Path to a Google credential file on the collector host.
+        Accepts a Service Account JSON key or a Workload Identity Federation (WIF)
+        external-credentials config file (e.g. /etc/security/wif/my-config.json).
+        Leave empty to use Application Default Credentials (ADC), which is the
+        correct setting when running on GKE with Workload Identity enabled.
       type: string
-      default: "year=2006/month=01/day=02"
+      required: false
+      default: ""
 
     # ── Batching (controls file size / freshness) ─────────────
     - name: batch_size
@@ -61,6 +78,62 @@ spec:
       type: string
       default: 5m
 
+    # ── Retry on failure ──────────────────────────────────────
+    - name: retry_enabled
+      label: Enable Retry on Failure
+      description: Retry failed exports with exponential back-off.
+      type: bool
+      default: true
+
+    - name: retry_initial_interval
+      label: Initial Interval
+      description: Time to wait after the first failure before retrying (e.g. 5s).
+      type: string
+      default: "5s"
+      relevantIf:
+        - name: retry_enabled
+          operator: equals
+          value: true
+
+    - name: retry_max_interval
+      label: Max Interval
+      description: Upper bound on retry back-off interval (e.g. 30s).
+      type: string
+      default: "30s"
+      relevantIf:
+        - name: retry_enabled
+          operator: equals
+          value: true
+
+    - name: retry_max_elapsed_time
+      label: Max Elapsed Time
+      description: Give up retrying after this total duration (e.g. 300s). 0 means never give up.
+      type: string
+      default: "300s"
+      relevantIf:
+        - name: retry_enabled
+          operator: equals
+          value: true
+
+    # ── Sending queue ─────────────────────────────────────────
+    - name: queue_enabled
+      label: Enable Sending Queue
+      description: Buffer exports in an in-memory queue to decouple ingestion from GCS writes.
+      type: bool
+      default: true
+
+    - name: queue_num_consumers
+      label: Number of Consumers
+      description: Number of workers that dequeue and send batches concurrently.
+      type: int
+      default: 10
+
+    - name: queue_size
+      label: Queue Size
+      description: Maximum number of batches held in memory before dropping.
+      type: int
+      default: 1000
+
   template: |
     processors:
       batch/parquet_gcs:
@@ -69,9 +142,19 @@ spec:
     exporters:
       parquetgcsstorage:
         {{ if .project_id }}project_id: "{{ .project_id }}"{{ end }}
+        {{ if .credentials_file }}credentials_file: "{{ .credentials_file }}"{{ end }}
         bucket: "{{ .bucket }}"
         prefix: "{{ .prefix }}"
-        partition_format: "{{ .partition_format }}"
+        partition_format: "{{ if eq .granularity "minute" }}year=2006/month=01/day=02/hour=15/minute=04{{ else if eq .granularity "hour" }}year=2006/month=01/day=02/hour=15{{ else }}year=2006/month=01/day=02{{ end }}"
+        retry_on_failure:
+          enabled: {{ .retry_enabled }}
+          initial_interval: {{ .retry_initial_interval }}
+          max_interval: {{ .retry_max_interval }}
+          max_elapsed_time: {{ .retry_max_elapsed_time }}
+        sending_queue:
+          enabled: {{ .queue_enabled }}
+          num_consumers: {{ .queue_num_consumers }}
+          queue_size: {{ .queue_size }}
     service:
       pipelines:
         logs:

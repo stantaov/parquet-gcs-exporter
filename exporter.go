@@ -34,6 +34,10 @@ func newExporter(cfg *Config, logger *zap.Logger) *parquetGCSExporter {
 
 func (e *parquetGCSExporter) start(ctx context.Context, _ component.Host) error {
 	var opts []option.ClientOption
+	if e.config.CredentialsFile != "" {
+		// Handles both SA JSON key files and WIF external-credentials config files.
+		opts = append(opts, option.WithCredentialsFile(e.config.CredentialsFile))
+	}
 	if e.config.ProjectID != "" {
 		opts = append(opts, option.WithQuotaProject(e.config.ProjectID))
 	}
