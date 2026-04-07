@@ -8,7 +8,7 @@ metadata:
     Each field in the log body becomes a Parquet column, partitioned by time.
     Files are written on a configurable batch size or timeout, whichever comes first.
 spec:
-  version: 0.1.0
+  version: 0.2.0
   parameters:
     - name: telemetry_types
       label: Telemetry Types
@@ -123,9 +123,9 @@ spec:
       label: Max Elapsed Time
       description: >
         Give up retrying after this total duration (in seconds).
-        Set to 0 to retry indefinitely.
+        Set to 0 to retry indefinitely (recommended for no data loss).
       type: int
-      default: 300
+      default: 0
       relevantIf:
         - name: retry_on_failure_enabled
           operator: equals
@@ -157,6 +157,21 @@ spec:
       default: 1000
       advancedConfig: true
 
+    - name: persistent_queue_storage
+      label: Persistent Queue Storage
+      description: >
+        Name of a filestorage extension to use for persistent queue.
+        When set, the queue survives collector restarts — no data loss on crash.
+        Example: file_storage/parquet_queue
+        Leave empty to use the default in-memory queue.
+      type: string
+      default: ""
+      relevantIf:
+        - name: sending_queue_enabled
+          operator: equals
+          value: true
+      advancedConfig: true
+
   logs:
     processors: |
       - batch/parquet_gcs:
@@ -175,5 +190,6 @@ spec:
           sending_queue:
             num_consumers: {{ .sending_queue_num_consumers }}
             queue_size: {{ .sending_queue_queue_size }}
+            {{ if .persistent_queue_storage }}storage: "{{ .persistent_queue_storage }}"{{ end }}
           {{ end }}
       {{ end }}
