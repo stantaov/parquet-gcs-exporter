@@ -3,7 +3,7 @@ kind: DestinationType
 metadata:
   name: parquet-gcs-storage
   displayName: Parquet GCS Storage
-  icon: https://www.stardog.com/img/connectors/logo-small/%E2%80%A6rquet.png
+  icon: /icons/sources/google-cloud.svg
   description: >
     Exports logs as Parquet files to Google Cloud Storage.
     Each field in the log body becomes a Parquet column, partitioned by time.
