@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +44,11 @@ func (e *parquetGCSExporter) shutdown(_ context.Context) error {
 // (which rotate every ~5 minutes) are always re-read from disk rather than
 // cached in a long-lived client.
 func (e *parquetGCSExporter) newGCSClient(ctx context.Context) (*storage.Client, error) {
+	// WIF executable-based credential sources require this env var.
+	// Set it unconditionally so the exporter works without requiring the
+	// caller to configure the environment separately.
+	os.Setenv("GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES", "1")
+
 	var opts []option.ClientOption
 	if e.config.CredentialsFile != "" {
 		opts = append(opts, option.WithCredentialsFile(e.config.CredentialsFile))
