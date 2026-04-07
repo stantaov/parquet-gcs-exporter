@@ -9,7 +9,7 @@ metadata:
     Each field in the log body becomes a Parquet column, partitioned by time.
     Files are written on a configurable batch size or timeout, whichever comes first.
 spec:
-  version: 0.2.0
+  version: 1.0.1
   parameters:
     - name: telemetry_types
       label: Telemetry Types

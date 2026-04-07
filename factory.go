@@ -13,6 +13,7 @@ import (
 	"github.com/stantaov/parquet-gcs-exporter/internal/metadata"
 )
 
+// NewFactory returns an exporter.Factory that creates parquetgcsstorage exporters.
 func NewFactory() exporter.Factory {
 	return exporter.NewFactory(
 		metadata.Type,
