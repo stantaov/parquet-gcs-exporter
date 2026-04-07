@@ -38,9 +38,6 @@ func (e *parquetGCSExporter) start(ctx context.Context, _ component.Host) error 
 		// Handles both SA JSON key files and WIF external-credentials config files.
 		opts = append(opts, option.WithCredentialsFile(e.config.CredentialsFile))
 	}
-	if e.config.ProjectID != "" {
-		opts = append(opts, option.WithQuotaProject(e.config.ProjectID))
-	}
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create GCS client: %w", err)
