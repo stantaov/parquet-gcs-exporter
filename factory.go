@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/exporter"
@@ -39,6 +40,6 @@ func createLogsExporter(ctx context.Context, set exporter.Settings, cfg componen
 		exporterhelper.WithStart(exp.start),
 		exporterhelper.WithShutdown(exp.shutdown),
 		exporterhelper.WithRetry(c.RetryConfig),
-		exporterhelper.WithQueue(c.QueueConfig),
+		exporterhelper.WithQueue(configoptional.Some(c.QueueConfig)),
 	)
 }

@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/parquet-go/parquet-go v0.24.0
 	go.opentelemetry.io/collector/component v1.52.0
+	go.opentelemetry.io/collector/config/configoptional v1.52.0
 	go.opentelemetry.io/collector/config/configretry v1.52.0
 	go.opentelemetry.io/collector/consumer v1.52.0
 	go.opentelemetry.io/collector/exporter v1.52.0
@@ -63,7 +64,6 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/client v1.52.0 // indirect
-	go.opentelemetry.io/collector/config/configoptional v1.52.0 // indirect
 	go.opentelemetry.io/collector/confmap v1.52.0 // indirect
 	go.opentelemetry.io/collector/confmap/xconfmap v0.146.1 // indirect
 	go.opentelemetry.io/collector/consumer/consumererror v0.146.1 // indirect

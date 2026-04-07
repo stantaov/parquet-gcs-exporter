@@ -33,7 +33,7 @@ type Config struct {
 	RetryConfig configretry.BackOffConfig `mapstructure:"retry_on_failure"`
 
 	// QueueConfig configures the in-memory sending queue.
-	QueueConfig exporterhelper.QueueConfig `mapstructure:"sending_queue"`
+	QueueConfig exporterhelper.QueueBatchConfig `mapstructure:"sending_queue"`
 }
 
 func (c *Config) Validate() error {

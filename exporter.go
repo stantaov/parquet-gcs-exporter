@@ -153,7 +153,7 @@ func writeParquet(records []map[string]string, keys []string) ([]byte, error) {
 				row[i] = parquet.NullValue().Level(0, 0, i)
 			}
 		}
-		if err := writer.WriteRows([]parquet.Row{row}); err != nil {
+		if _, err := writer.WriteRows([]parquet.Row{row}); err != nil {
 			return nil, fmt.Errorf("write row: %w", err)
 		}
 	}
