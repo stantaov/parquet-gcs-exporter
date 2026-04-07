@@ -171,5 +171,9 @@ spec:
           {{ if .credentials_file }}credentials_file: "{{ .credentials_file }}"{{ end }}
           partition_format: "{{ if eq .granularity "minute" }}year=2006/month=01/day=02/hour=15/minute=04{{ else if eq .granularity "hour" }}year=2006/month=01/day=02/hour=15{{ else }}year=2006/month=01/day=02{{ end }}"
           {{ bpRenderOtelRetryOnFailureConfig .retry_on_failure_enabled .retry_on_failure_initial_interval .retry_on_failure_max_interval .retry_on_failure_max_elapsed_time }}
-          {{ bpRenderOtelSendingQueueConfig .sending_queue_enabled false "" .sending_queue_num_consumers .sending_queue_queue_size }}
+          {{ if .sending_queue_enabled }}
+          sending_queue:
+            num_consumers: {{ .sending_queue_num_consumers }}
+            queue_size: {{ .sending_queue_queue_size }}
+          {{ end }}
       {{ end }}

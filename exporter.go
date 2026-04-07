@@ -22,7 +22,6 @@ import (
 type parquetGCSExporter struct {
 	config *Config
 	logger *zap.Logger
-	client *storage.Client
 }
 
 func newExporter(cfg *Config, logger *zap.Logger) *parquetGCSExporter {
@@ -32,25 +31,27 @@ func newExporter(cfg *Config, logger *zap.Logger) *parquetGCSExporter {
 	}
 }
 
-func (e *parquetGCSExporter) start(ctx context.Context, _ component.Host) error {
-	var opts []option.ClientOption
-	if e.config.CredentialsFile != "" {
-		// Handles both SA JSON key files and WIF external-credentials config files.
-		opts = append(opts, option.WithCredentialsFile(e.config.CredentialsFile))
-	}
-	client, err := storage.NewClient(ctx, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to create GCS client: %w", err)
-	}
-	e.client = client
+func (e *parquetGCSExporter) start(_ context.Context, _ component.Host) error {
 	return nil
 }
 
 func (e *parquetGCSExporter) shutdown(_ context.Context) error {
-	if e.client != nil {
-		return e.client.Close()
-	}
 	return nil
+}
+
+// newGCSClient creates a fresh GCS client on every call so that WIF credentials
+// (which rotate every ~5 minutes) are always re-read from disk rather than
+// cached in a long-lived client.
+func (e *parquetGCSExporter) newGCSClient(ctx context.Context) (*storage.Client, error) {
+	var opts []option.ClientOption
+	if e.config.CredentialsFile != "" {
+		opts = append(opts, option.WithCredentialsFile(e.config.CredentialsFile))
+	}
+	client, err := storage.NewClient(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create GCS client: %w", err)
+	}
+	return client, nil
 }
 
 func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) error {
@@ -176,7 +177,13 @@ func (e *parquetGCSExporter) objectPath() string {
 }
 
 func (e *parquetGCSExporter) upload(ctx context.Context, path string, data []byte) error {
-	w := e.client.Bucket(e.config.Bucket).Object(path).NewWriter(ctx)
+	client, err := e.newGCSClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	w := client.Bucket(e.config.Bucket).Object(path).NewWriter(ctx)
 	w.ContentType = "application/octet-stream"
 	if _, err := w.Write(data); err != nil {
 		_ = w.Close()
