@@ -1,0 +1,189 @@
+name: Vulnerability Check
+
+on:
+  schedule:
+    # Runs every Monday at 8:00 AM UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck (JSON)
+        id: vulncheck
+        run: |
+          govulncheck -json ./... > vulncheck_raw.json 2>&1 || true
+
+      - name: Generate vulnerability report
+        run: |
+          python3 << 'SCRIPT'
+          import json
+          import datetime
+
+          # Parse govulncheck JSON output (one JSON object per line)
+          findings = []
+          osv_entries = {}
+          config_info = {}
+
+          with open("vulncheck_raw.json") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      obj = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+
+                  # Config message
+                  if "config" in obj:
+                      config_info = obj["config"]
+
+                  # OSV entry (vulnerability metadata)
+                  if "osv" in obj:
+                      entry = obj["osv"]
+                      osv_entries[entry["id"]] = entry
+
+                  # Finding (actual match in code)
+                  if "finding" in obj:
+                      findings.append(obj["finding"])
+
+          # Group findings by OSV ID
+          vulns_by_id = {}
+          for f in findings:
+              osv_id = f.get("osv", "")
+              if osv_id not in vulns_by_id:
+                  vulns_by_id[osv_id] = {
+                      "osv_id": osv_id,
+                      "traces": [],
+                  }
+              vulns_by_id[osv_id]["traces"].append(f.get("trace", []))
+
+          # Build markdown report
+          now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          lines = [
+              "# Vulnerability Report",
+              "",
+              f"**Generated:** {now}",
+              f"**Scanner:** govulncheck",
+              f"**Go version:** {config_info.get('go_version', 'unknown')}",
+              f"**Total vulnerabilities:** {len(vulns_by_id)}",
+              "",
+          ]
+
+          if not vulns_by_id:
+              lines.append("No vulnerabilities found.")
+          else:
+              # Categorize by level
+              symbol_level = []
+              pkg_level = []
+
+              for osv_id, vuln in sorted(vulns_by_id.items()):
+                  osv = osv_entries.get(osv_id, {})
+
+                  # Determine if symbol-level (trace has function frames)
+                  has_symbol = False
+                  for trace in vuln["traces"]:
+                      if len(trace) > 1:
+                          has_symbol = True
+                          break
+
+                  summary = osv.get("summary", "No description")
+                  aliases = osv.get("aliases", [])
+                  cve = next((a for a in aliases if a.startswith("CVE-")), "N/A")
+
+                  # Get affected module/package and fixed version
+                  affected = osv.get("affected", [{}])
+                  module = ""
+                  fixed = "unknown"
+                  for aff in affected:
+                      pkg_info = aff.get("package", aff.get("module", {}))
+                      if isinstance(pkg_info, dict):
+                          module = pkg_info.get("name", "")
+                      elif isinstance(pkg_info, str):
+                          module = pkg_info
+
+                      for r in aff.get("ranges", []):
+                          for event in r.get("events", []):
+                              if "fixed" in event:
+                                  fixed = event["fixed"]
+
+                  entry = {
+                      "osv_id": osv_id,
+                      "cve": cve,
+                      "summary": summary,
+                      "module": module,
+                      "fixed": fixed,
+                      "symbol": has_symbol,
+                  }
+
+                  if has_symbol:
+                      symbol_level.append(entry)
+                  else:
+                      pkg_level.append(entry)
+
+              if symbol_level:
+                  lines.append("## Symbol-Level Vulnerabilities (code calls vulnerable functions)")
+                  lines.append("")
+                  lines.append("| ID | CVE | Module | Summary | Fixed In |")
+                  lines.append("|---|---|---|---|---|")
+                  for e in symbol_level:
+                      lines.append(f"| [{e['osv_id']}](https://pkg.go.dev/vuln/{e['osv_id']}) | {e['cve']} | `{e['module']}` | {e['summary']} | `{e['fixed']}` |")
+                  lines.append("")
+
+              if pkg_level:
+                  lines.append("## Module/Package-Level Vulnerabilities (in dependency tree)")
+                  lines.append("")
+                  lines.append("| ID | CVE | Module | Summary | Fixed In |")
+                  lines.append("|---|---|---|---|---|")
+                  for e in pkg_level:
+                      lines.append(f"| [{e['osv_id']}](https://pkg.go.dev/vuln/{e['osv_id']}) | {e['cve']} | `{e['module']}` | {e['summary']} | `{e['fixed']}` |")
+                  lines.append("")
+
+              lines.append("## Recommendations")
+              lines.append("")
+
+              # Check if stdlib vulns exist
+              stdlib_vulns = [v for v in symbol_level + pkg_level if v["module"] == "stdlib" or v["module"].startswith("go")]
+              thirdparty_vulns = [v for v in symbol_level + pkg_level if v["module"] != "stdlib" and not v["module"].startswith("go")]
+
+              if stdlib_vulns:
+                  max_fixed = max((v["fixed"] for v in stdlib_vulns), default="latest")
+                  lines.append(f"- **Upgrade Go toolchain** to `{max_fixed}` or later to fix {len(stdlib_vulns)} stdlib vulnerabilities")
+
+              for v in thirdparty_vulns:
+                  lines.append(f"- **Upgrade `{v['module']}`** to `{v['fixed']}` ({v['cve']}: {v['summary']})")
+
+              if not stdlib_vulns and not thirdparty_vulns:
+                  lines.append("- No action required")
+
+          with open("VULNERABILITIES.md", "w") as f:
+              f.write("\n".join(lines) + "\n")
+
+          print(f"Report generated: {len(vulns_by_id)} vulnerabilities")
+          SCRIPT
+
+      - name: Commit report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VULNERABILITIES.md
+          if git diff --cached --quiet; then
+            echo "No changes to report"
+          else
+            git commit -m "chore: update vulnerability report $(date +%Y-%m-%d)"
+            git push
+          fi
