@@ -2,6 +2,7 @@ package parquetgcsexporter
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,21 +15,35 @@ import (
 	"go.uber.org/zap"
 )
 
-// --- extractBodyMaps ---
+// fullBody puts every BQ-schema column into a body map so tests can verify
+// the happy path. Timestamps are stored as Unix nanoseconds (BindPlane's
+// convention).
+func fullBody(m pcommon.Map) {
+	m.PutInt("rcvd_ts", 1777494951867724305)             // 2026-04-29T20:35:51.867724305Z
+	m.PutInt("event_ts", 1777494952000000000)            // 2026-04-29T20:35:52Z
+	m.PutStr("collector", "stepwell-abtoll-1")
+	m.PutStr("namespace", "TEN Cisco WSA")
+	m.PutStr("log_type", "CISCO_WSA")
+	m.PutStr("source_ip", "142.178.49.138")
+	m.PutStr("hostname", "abc-secwe02.nssi.telus.com")
+	m.PutStr("appname", "abc-secwe02_stepwell_access")
+	m.PutInt("facility", 1)
+	m.PutInt("severity", 6)
+	m.PutStr("event_message", "<14>Apr 29 20:35:52 abc raw syslog line")
+	m.PutStr("event_details_json", `{"cache_hit":"TCP_MISS","duration":"10040"}`)
+	m.PutStr("parse_status", "parsed")
+}
 
-func TestExtractBodyMaps_TypedValues(t *testing.T) {
+// --- extractRecords ---
+
+func TestExtractRecords_FullRecord(t *testing.T) {
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	sl := rl.ScopeLogs().AppendEmpty()
-
 	lr := sl.LogRecords().AppendEmpty()
-	m := lr.Body().SetEmptyMap()
-	m.PutStr("host", "web-01")
-	m.PutInt("status", 200)
-	m.PutDouble("latency", 1.5)
-	m.PutBool("ok", true)
+	fullBody(lr.Body().SetEmptyMap())
 
-	records, skipped := extractBodyMaps(ld)
+	records, skipped := extractRecords(ld)
 	if skipped != 0 {
 		t.Errorf("expected 0 skipped, got %d", skipped)
 	}
@@ -37,209 +52,151 @@ func TestExtractBodyMaps_TypedValues(t *testing.T) {
 	}
 	r := records[0]
 
-	if v := r["host"]; v.vType != pcommon.ValueTypeStr || v.str != "web-01" {
-		t.Errorf("host: got %+v", v)
+	// nanos / 1000 = micros
+	if r.rcvdTsMicros != 1777494951867724 {
+		t.Errorf("rcvdTsMicros: got %d", r.rcvdTsMicros)
 	}
-	if v := r["status"]; v.vType != pcommon.ValueTypeInt || v.i64 != 200 {
-		t.Errorf("status: got %+v", v)
+	if r.eventTsMicros != 1777494952000000 {
+		t.Errorf("eventTsMicros: got %d", r.eventTsMicros)
 	}
-	if v := r["latency"]; v.vType != pcommon.ValueTypeDouble || v.f64 != 1.5 {
-		t.Errorf("latency: got %+v", v)
+	if r.collector == nil || *r.collector != "stepwell-abtoll-1" {
+		t.Errorf("collector: %v", r.collector)
 	}
-	if v := r["ok"]; v.vType != pcommon.ValueTypeBool || v.b != true {
-		t.Errorf("ok: got %+v", v)
+	if r.facility == nil || *r.facility != 1 {
+		t.Errorf("facility: %v", r.facility)
+	}
+	if r.severity == nil || *r.severity != 6 {
+		t.Errorf("severity: %v", r.severity)
+	}
+	if string(r.eventDetailsJSON) != `{"cache_hit":"TCP_MISS","duration":"10040"}` {
+		t.Errorf("eventDetailsJSON: %q", r.eventDetailsJSON)
+	}
+	if r.parseStatus == nil || *r.parseStatus != "parsed" {
+		t.Errorf("parseStatus: %v", r.parseStatus)
 	}
 }
 
-func TestExtractBodyMaps_SkipsNonMap(t *testing.T) {
+func TestExtractRecords_SkipsNonMapBody(t *testing.T) {
 	ld := plog.NewLogs()
-	rl := ld.ResourceLogs().AppendEmpty()
-	sl := rl.ScopeLogs().AppendEmpty()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	sl.LogRecords().AppendEmpty().Body().SetStr("plain text")
+	sl.LogRecords().AppendEmpty().Body().SetInt(42)
+	fullBody(sl.LogRecords().AppendEmpty().Body().SetEmptyMap())
 
-	// String body — should be skipped.
-	lr1 := sl.LogRecords().AppendEmpty()
-	lr1.Body().SetStr("plain text log line")
-
-	// Map body — should be included.
-	lr2 := sl.LogRecords().AppendEmpty()
-	lr2.Body().SetEmptyMap().PutStr("key", "val")
-
-	records, skipped := extractBodyMaps(ld)
-	if skipped != 1 {
-		t.Errorf("expected 1 skipped, got %d", skipped)
+	records, skipped := extractRecords(ld)
+	if skipped != 2 {
+		t.Errorf("expected 2 skipped, got %d", skipped)
 	}
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
-	if records[0]["key"].str != "val" {
-		t.Errorf("unexpected value: %+v", records[0]["key"])
-	}
 }
 
-func TestExtractBodyMaps_MultipleSkipped(t *testing.T) {
+func TestExtractRecords_SkipsMissingRequiredTimestamps(t *testing.T) {
 	ld := plog.NewLogs()
-	rl := ld.ResourceLogs().AppendEmpty()
-	sl := rl.ScopeLogs().AppendEmpty()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
 
-	// Three non-map bodies.
-	sl.LogRecords().AppendEmpty().Body().SetStr("line 1")
-	sl.LogRecords().AppendEmpty().Body().SetStr("line 2")
-	sl.LogRecords().AppendEmpty().Body().SetInt(42)
+	// Missing rcvd_ts — must skip.
+	m1 := sl.LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m1.PutInt("event_ts", 1777494952000000000)
 
-	// One map body.
-	sl.LogRecords().AppendEmpty().Body().SetEmptyMap().PutStr("k", "v")
+	// Missing event_ts — must skip.
+	m2 := sl.LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m2.PutInt("rcvd_ts", 1777494951867724305)
 
-	records, skipped := extractBodyMaps(ld)
+	// rcvd_ts present but as a string — must skip (not coercible).
+	m3 := sl.LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m3.PutStr("rcvd_ts", "1777494951867724305")
+	m3.PutInt("event_ts", 1777494952000000000)
+
+	// Valid.
+	fullBody(sl.LogRecords().AppendEmpty().Body().SetEmptyMap())
+
+	records, skipped := extractRecords(ld)
 	if skipped != 3 {
 		t.Errorf("expected 3 skipped, got %d", skipped)
 	}
 	if len(records) != 1 {
-		t.Fatalf("expected 1 record, got %d", len(records))
+		t.Errorf("expected 1 record, got %d", len(records))
 	}
 }
 
-func TestExtractBodyMaps_MultipleResourceAndScopes(t *testing.T) {
+func TestExtractRecords_OptionalFieldsAbsent(t *testing.T) {
 	ld := plog.NewLogs()
+	m := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m.PutInt("rcvd_ts", 1000)
+	m.PutInt("event_ts", 2000)
+	// All other fields absent.
 
-	for i := 0; i < 2; i++ {
-		rl := ld.ResourceLogs().AppendEmpty()
-		sl := rl.ScopeLogs().AppendEmpty()
-		lr := sl.LogRecords().AppendEmpty()
-		lr.Body().SetEmptyMap().PutStr("src", "resource")
+	records, _ := extractRecords(ld)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record")
 	}
-
-	records, skipped := extractBodyMaps(ld)
-	if skipped != 0 {
-		t.Errorf("expected 0 skipped, got %d", skipped)
-	}
-	if len(records) != 2 {
-		t.Fatalf("expected 2 records across resources, got %d", len(records))
+	r := records[0]
+	if r.collector != nil || r.namespace != nil || r.logType != nil ||
+		r.sourceIP != nil || r.hostname != nil || r.appname != nil ||
+		r.facility != nil || r.severity != nil || r.eventMessage != nil ||
+		r.parseStatus != nil || r.eventDetailsJSON != nil {
+		t.Errorf("expected all optional fields to be nil, got %+v", r)
 	}
 }
 
-func TestExtractBodyMaps_Empty(t *testing.T) {
+func TestExtractRecords_ExtraFieldsIgnored(t *testing.T) {
 	ld := plog.NewLogs()
-	records, skipped := extractBodyMaps(ld)
-	if skipped != 0 {
-		t.Errorf("expected 0 skipped, got %d", skipped)
+	m := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptyMap()
+	fullBody(m)
+	m.PutStr("not_in_schema_1", "ignored")
+	m.PutInt("not_in_schema_2", 99)
+
+	records, skipped := extractRecords(ld)
+	if skipped != 0 || len(records) != 1 {
+		t.Fatalf("expected 1 record, 0 skipped; got %d, %d", len(records), skipped)
 	}
-	if len(records) != 0 {
-		t.Fatalf("expected 0 records, got %d", len(records))
+	// Extra fields should not surface anywhere — just confirm projection succeeded.
+	if records[0].collector == nil || *records[0].collector != "stepwell-abtoll-1" {
+		t.Errorf("expected projection to succeed despite extra fields")
 	}
 }
 
-// --- inferSchema ---
+func TestExtractRecords_EventDetailsJSON_AsMap(t *testing.T) {
+	// BindPlane normally emits event_details_json as a string. Verify the
+	// defensive map path also works in case the upstream pipeline changes.
+	ld := plog.NewLogs()
+	m := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m.PutInt("rcvd_ts", 1000)
+	m.PutInt("event_ts", 2000)
+	details := m.PutEmptyMap("event_details_json")
+	details.PutStr("cache_hit", "TCP_MISS")
+	details.PutInt("duration", 10040)
 
-func TestInferSchema_ConsistentTypes(t *testing.T) {
-	records := []map[string]typedValue{
-		{"count": {vType: pcommon.ValueTypeInt, i64: 1}, "name": {vType: pcommon.ValueTypeStr, str: "x"}},
-		{"count": {vType: pcommon.ValueTypeInt, i64: 2}, "name": {vType: pcommon.ValueTypeStr, str: "y"}},
+	records, _ := extractRecords(ld)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record")
 	}
-
-	keys, ct := inferSchema(records)
-	if len(keys) != 2 || keys[0] != "count" || keys[1] != "name" {
-		t.Fatalf("keys: %v", keys)
+	var got map[string]any
+	if err := json.Unmarshal(records[0].eventDetailsJSON, &got); err != nil {
+		t.Fatalf("unmarshal: %v (raw: %s)", err, records[0].eventDetailsJSON)
 	}
-	if ct["count"] != colInt64 {
-		t.Errorf("count: expected colInt64, got %d", ct["count"])
-	}
-	if ct["name"] != colString {
-		t.Errorf("name: expected colString, got %d", ct["name"])
-	}
-}
-
-func TestInferSchema_MixedTypesFallbackToString(t *testing.T) {
-	records := []map[string]typedValue{
-		{"x": {vType: pcommon.ValueTypeInt, i64: 42, str: "42"}},
-		{"x": {vType: pcommon.ValueTypeStr, str: "hello"}},
-	}
-
-	_, ct := inferSchema(records)
-	if ct["x"] != colString {
-		t.Errorf("x: expected colString (mixed), got %d", ct["x"])
-	}
-}
-
-func TestInferSchema_SortedKeys(t *testing.T) {
-	records := []map[string]typedValue{
-		{
-			"zebra":  {vType: pcommon.ValueTypeStr},
-			"alpha":  {vType: pcommon.ValueTypeStr},
-			"middle": {vType: pcommon.ValueTypeStr},
-		},
-	}
-
-	keys, _ := inferSchema(records)
-	if keys[0] != "alpha" || keys[1] != "middle" || keys[2] != "zebra" {
-		t.Errorf("expected sorted keys, got %v", keys)
-	}
-}
-
-func TestInferSchema_AllColumnTypes(t *testing.T) {
-	records := []map[string]typedValue{
-		{
-			"s": {vType: pcommon.ValueTypeStr, str: "hi"},
-			"i": {vType: pcommon.ValueTypeInt, i64: 10},
-			"d": {vType: pcommon.ValueTypeDouble, f64: 3.14},
-			"b": {vType: pcommon.ValueTypeBool, b: true},
-		},
-	}
-
-	_, ct := inferSchema(records)
-	if ct["s"] != colString {
-		t.Errorf("s: expected colString")
-	}
-	if ct["i"] != colInt64 {
-		t.Errorf("i: expected colInt64")
-	}
-	if ct["d"] != colDouble {
-		t.Errorf("d: expected colDouble")
-	}
-	if ct["b"] != colBool {
-		t.Errorf("b: expected colBool")
-	}
-}
-
-// --- valueTypeToColumnType ---
-
-func TestValueTypeToColumnType(t *testing.T) {
-	tests := []struct {
-		vt   pcommon.ValueType
-		want columnType
-	}{
-		{pcommon.ValueTypeInt, colInt64},
-		{pcommon.ValueTypeDouble, colDouble},
-		{pcommon.ValueTypeBool, colBool},
-		{pcommon.ValueTypeStr, colString},
-		{pcommon.ValueTypeMap, colString},
-		{pcommon.ValueTypeSlice, colString},
-	}
-	for _, tt := range tests {
-		if got := valueTypeToColumnType(tt.vt); got != tt.want {
-			t.Errorf("valueTypeToColumnType(%v) = %d, want %d", tt.vt, got, tt.want)
-		}
+	if got["cache_hit"] != "TCP_MISS" {
+		t.Errorf("cache_hit: %v", got["cache_hit"])
 	}
 }
 
 // --- writeParquet ---
 
 func TestWriteParquet_RoundTrip(t *testing.T) {
-	records := []map[string]typedValue{
-		{
-			"name":   {vType: pcommon.ValueTypeStr, str: "alice"},
-			"age":    {vType: pcommon.ValueTypeInt, i64: 30, str: "30"},
-			"score":  {vType: pcommon.ValueTypeDouble, f64: 9.5, str: "9.5"},
-			"active": {vType: pcommon.ValueTypeBool, b: true, str: "true"},
-		},
-		{
-			"name": {vType: pcommon.ValueTypeStr, str: "bob"},
-			"age":  {vType: pcommon.ValueTypeInt, i64: 25, str: "25"},
-			// score and active missing → null
-		},
-	}
-	keys, colTypes := inferSchema(records)
+	ld := plog.NewLogs()
+	sl := ld.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty()
+	fullBody(sl.LogRecords().AppendEmpty().Body().SetEmptyMap())
 
-	data, err := writeParquet(records, keys, colTypes)
+	// Second record has only required fields.
+	m2 := sl.LogRecords().AppendEmpty().Body().SetEmptyMap()
+	m2.PutInt("rcvd_ts", 5000)
+	m2.PutInt("event_ts", 6000)
+
+	records, _ := extractRecords(ld)
+
+	data, err := writeParquet(records)
 	if err != nil {
 		t.Fatalf("writeParquet: %v", err)
 	}
@@ -248,82 +205,43 @@ func TestWriteParquet_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
-
 	if f.NumRows() != 2 {
 		t.Errorf("expected 2 rows, got %d", f.NumRows())
+	}
+
+	// Verify the schema has all 13 columns with the expected names.
+	want := map[string]bool{
+		"rcvd_ts": false, "event_ts": false, "collector": false,
+		"namespace": false, "log_type": false, "source_ip": false,
+		"hostname": false, "appname": false, "facility": false,
+		"severity": false, "event_message": false,
+		"event_details_json": false, "parse_status": false,
+	}
+	for _, col := range f.Schema().Columns() {
+		if len(col) == 1 {
+			if _, ok := want[col[0]]; ok {
+				want[col[0]] = true
+			}
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("schema missing column %q", name)
+		}
 	}
 }
 
-func TestWriteParquet_AllStrings(t *testing.T) {
-	records := []map[string]typedValue{
-		{"a": {vType: pcommon.ValueTypeStr, str: "hello"}},
-		{"a": {vType: pcommon.ValueTypeStr, str: "world"}},
-	}
-	keys := []string{"a"}
-	colTypes := map[string]columnType{"a": colString}
-
-	data, err := writeParquet(records, keys, colTypes)
+func TestWriteParquet_EmptyRecords(t *testing.T) {
+	data, err := writeParquet(nil)
 	if err != nil {
-		t.Fatalf("writeParquet: %v", err)
+		t.Fatalf("writeParquet([]): %v", err)
 	}
-
 	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		t.Fatalf("OpenFile: %v", err)
 	}
-	if f.NumRows() != 2 {
-		t.Errorf("expected 2 rows, got %d", f.NumRows())
-	}
-}
-
-func TestWriteParquet_NullableColumns(t *testing.T) {
-	records := []map[string]typedValue{
-		{
-			"a": {vType: pcommon.ValueTypeStr, str: "x"},
-			"b": {vType: pcommon.ValueTypeStr, str: "y"},
-		},
-		{
-			"a": {vType: pcommon.ValueTypeStr, str: "z"},
-		},
-	}
-	keys, colTypes := inferSchema(records)
-
-	data, err := writeParquet(records, keys, colTypes)
-	if err != nil {
-		t.Fatalf("writeParquet: %v", err)
-	}
-
-	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
-	}
-	if f.NumRows() != 2 {
-		t.Errorf("expected 2 rows, got %d", f.NumRows())
-	}
-}
-
-func TestWriteParquet_MixedTypeFallback(t *testing.T) {
-	records := []map[string]typedValue{
-		{"val": {vType: pcommon.ValueTypeInt, i64: 42, str: "42"}},
-		{"val": {vType: pcommon.ValueTypeStr, str: "hello"}},
-	}
-	keys, colTypes := inferSchema(records)
-
-	if colTypes["val"] != colString {
-		t.Fatalf("expected colString for mixed type, got %d", colTypes["val"])
-	}
-
-	data, err := writeParquet(records, keys, colTypes)
-	if err != nil {
-		t.Fatalf("writeParquet: %v", err)
-	}
-
-	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatalf("OpenFile: %v", err)
-	}
-	if f.NumRows() != 2 {
-		t.Errorf("expected 2 rows, got %d", f.NumRows())
+	if f.NumRows() != 0 {
+		t.Errorf("expected 0 rows, got %d", f.NumRows())
 	}
 }
 

@@ -3,9 +3,9 @@ package parquetgcsexporter
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,23 +28,62 @@ import (
 // refreshed. WIF tokens rotate every ~5 min; 4 min gives comfortable headroom.
 const clientMaxAge = 4 * time.Minute
 
-// columnType represents the Parquet column type inferred from log values.
-type columnType int
-
+// Column ordinals for the fixed Parquet schema. parquet.Group orders fields
+// alphabetically, so these indices match the alphabetically sorted names below.
 const (
-	colString columnType = iota
-	colInt64
-	colDouble
-	colBool
+	idxAppname = iota
+	idxCollector
+	idxEventDetailsJSON
+	idxEventMessage
+	idxEventTs
+	idxFacility
+	idxHostname
+	idxLogType
+	idxNamespace
+	idxParseStatus
+	idxRcvdTs
+	idxSeverity
+	idxSourceIP
+	numColumns
 )
 
-// typedValue preserves the original pcommon.Value type for type-aware Parquet encoding.
-type typedValue struct {
-	vType pcommon.ValueType
-	str   string
-	i64   int64
-	f64   float64
-	b     bool
+// fixedSchema mirrors the destination BigQuery table 1:1.
+// rcvd_ts and event_ts are REQUIRED; all other columns are NULLABLE.
+// Timestamps are stored as INT64 microseconds (TIMESTAMP_MICROS, UTC),
+// which BigQuery loads natively into TIMESTAMP. event_details_json uses
+// the JSON logical type, which BigQuery loads natively into JSON.
+var fixedSchema = parquet.NewSchema("logs", parquet.Group{
+	"rcvd_ts":            parquet.Timestamp(parquet.Microsecond),
+	"event_ts":           parquet.Timestamp(parquet.Microsecond),
+	"collector":          parquet.Optional(parquet.String()),
+	"namespace":          parquet.Optional(parquet.String()),
+	"log_type":           parquet.Optional(parquet.String()),
+	"source_ip":          parquet.Optional(parquet.String()),
+	"hostname":           parquet.Optional(parquet.String()),
+	"appname":            parquet.Optional(parquet.String()),
+	"facility":           parquet.Optional(parquet.Int(64)),
+	"severity":           parquet.Optional(parquet.Int(64)),
+	"event_message":      parquet.Optional(parquet.String()),
+	"event_details_json": parquet.Optional(parquet.JSON()),
+	"parse_status":       parquet.Optional(parquet.String()),
+})
+
+// record is a single log record projected onto the fixed BQ schema.
+// Pointer fields distinguish absent (nil) from zero-valued.
+type record struct {
+	rcvdTsMicros     int64
+	eventTsMicros    int64
+	collector        *string
+	namespace        *string
+	logType          *string
+	sourceIP         *string
+	hostname         *string
+	appname          *string
+	facility         *int64
+	severity         *int64
+	eventMessage     *string
+	eventDetailsJSON []byte
+	parseStatus      *string
 }
 
 type parquetGCSExporter struct {
@@ -74,7 +113,7 @@ func newExporter(cfg *Config, logger *zap.Logger, mp metric.MeterProvider) (*par
 	}
 
 	recordsSkipped, err := meter.Int64Counter("parquetgcsstorage.records.skipped",
-		metric.WithDescription("Number of log records skipped due to non-map body"),
+		metric.WithDescription("Number of log records skipped due to non-map body or missing required fields"),
 		metric.WithUnit("{records}"),
 	)
 	if err != nil {
@@ -161,10 +200,13 @@ func (e *parquetGCSExporter) getClient(ctx context.Context) (*storage.Client, er
 }
 
 func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) error {
-	records, skipped := extractBodyMaps(ld)
+	records, skipped := extractRecords(ld)
 
 	if skipped > 0 {
-		e.logger.Debug("skipped log records with non-map bodies", zap.Int("skipped", skipped))
+		e.logger.Debug("skipped log records",
+			zap.Int("skipped", skipped),
+			zap.String("reason", "non-map body or missing required rcvd_ts/event_ts"),
+		)
 		e.recordsSkipped.Add(ctx, int64(skipped))
 	}
 
@@ -172,9 +214,7 @@ func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) erro
 		return nil
 	}
 
-	keys, colTypes := inferSchema(records)
-
-	buf, err := writeParquet(records, keys, colTypes)
+	buf, err := writeParquet(records)
 	if err != nil {
 		return fmt.Errorf("failed to encode parquet: %w", err)
 	}
@@ -195,18 +235,16 @@ func (e *parquetGCSExporter) consumeLogs(ctx context.Context, ld plog.Logs) erro
 		zap.String("bucket", e.config.Bucket),
 		zap.String("object", objectPath),
 		zap.Int("records", len(records)),
-		zap.Int("columns", len(keys)),
 		zap.Int("bytes", len(buf)),
 		zap.Int64("upload_ms", uploadMs),
 	)
 	return nil
 }
 
-// extractBodyMaps walks all log records and returns each body map with
-// preserved value types. Records whose body is not a map are counted as
-// skipped and excluded from the result.
-func extractBodyMaps(ld plog.Logs) ([]map[string]typedValue, int) {
-	var records []map[string]typedValue
+// extractRecords walks all log records and projects each onto the fixed schema.
+// Records with non-map bodies or missing required rcvd_ts/event_ts are skipped.
+func extractRecords(ld plog.Logs) ([]record, int) {
+	var records []record
 	var skipped int
 	for i := 0; i < ld.ResourceLogs().Len(); i++ {
 		rl := ld.ResourceLogs().At(i)
@@ -218,95 +256,125 @@ func extractBodyMaps(ld plog.Logs) ([]map[string]typedValue, int) {
 					skipped++
 					continue
 				}
-				row := make(map[string]typedValue)
-				lr.Body().Map().Range(func(key string, val pcommon.Value) bool {
-					tv := typedValue{vType: val.Type(), str: val.AsString()}
-					switch val.Type() {
-					case pcommon.ValueTypeInt:
-						tv.i64 = val.Int()
-					case pcommon.ValueTypeDouble:
-						tv.f64 = val.Double()
-					case pcommon.ValueTypeBool:
-						tv.b = val.Bool()
-					}
-					row[key] = tv
-					return true
-				})
-				records = append(records, row)
+				body := lr.Body().Map()
+				rec, ok := projectRecord(body)
+				if !ok {
+					skipped++
+					continue
+				}
+				records = append(records, rec)
 			}
 		}
 	}
 	return records, skipped
 }
 
-// inferSchema collects all unique keys across records and determines each
-// column's Parquet type. If all values for a key share a type, that type is
-// used; mixed types fall back to string. Keys are returned sorted for
-// deterministic column ordering.
-func inferSchema(records []map[string]typedValue) ([]string, map[string]columnType) {
-	colTypes := make(map[string]columnType)
-	initialized := make(map[string]bool)
-
-	for _, r := range records {
-		for k, v := range r {
-			ct := valueTypeToColumnType(v.vType)
-			if !initialized[k] {
-				colTypes[k] = ct
-				initialized[k] = true
-			} else if colTypes[k] != ct {
-				colTypes[k] = colString
-			}
-		}
+// projectRecord pulls the BQ schema columns out of a body map. Returns ok=false
+// if either required timestamp field is missing or unparseable.
+func projectRecord(body pcommon.Map) (record, bool) {
+	rcvdTs, ok := bodyTimestampMicros(body, "rcvd_ts")
+	if !ok {
+		return record{}, false
 	}
-
-	keys := make([]string, 0, len(colTypes))
-	for k := range colTypes {
-		keys = append(keys, k)
+	eventTs, ok := bodyTimestampMicros(body, "event_ts")
+	if !ok {
+		return record{}, false
 	}
-	sort.Strings(keys)
-	return keys, colTypes
+	return record{
+		rcvdTsMicros:     rcvdTs,
+		eventTsMicros:    eventTs,
+		collector:        bodyString(body, "collector"),
+		namespace:        bodyString(body, "namespace"),
+		logType:          bodyString(body, "log_type"),
+		sourceIP:         bodyString(body, "source_ip"),
+		hostname:         bodyString(body, "hostname"),
+		appname:          bodyString(body, "appname"),
+		facility:         bodyInt(body, "facility"),
+		severity:         bodyInt(body, "severity"),
+		eventMessage:     bodyString(body, "event_message"),
+		eventDetailsJSON: bodyJSONBytes(body, "event_details_json"),
+		parseStatus:      bodyString(body, "parse_status"),
+	}, true
 }
 
-func valueTypeToColumnType(vt pcommon.ValueType) columnType {
-	switch vt {
+// bodyString returns the value at key as a string pointer, or nil if absent.
+// Non-string types are coerced via pcommon.Value.AsString().
+func bodyString(m pcommon.Map, key string) *string {
+	v, ok := m.Get(key)
+	if !ok {
+		return nil
+	}
+	s := v.AsString()
+	return &s
+}
+
+// bodyInt returns the value at key as an int64 pointer, or nil if absent or
+// not coercible to an integer.
+func bodyInt(m pcommon.Map, key string) *int64 {
+	v, ok := m.Get(key)
+	if !ok {
+		return nil
+	}
+	switch v.Type() {
 	case pcommon.ValueTypeInt:
-		return colInt64
+		i := v.Int()
+		return &i
 	case pcommon.ValueTypeDouble:
-		return colDouble
-	case pcommon.ValueTypeBool:
-		return colBool
+		i := int64(v.Double())
+		return &i
 	default:
-		return colString
+		return nil
 	}
 }
 
-// writeParquet encodes records as a Parquet file using the inferred column types.
-// Missing fields in a record are written as null.
-func writeParquet(records []map[string]typedValue, keys []string, colTypes map[string]columnType) ([]byte, error) {
-	group := parquet.Group{}
-	for _, k := range keys {
-		group[k] = parquet.Optional(parquetNode(colTypes[k]))
+// bodyTimestampMicros reads a Unix-nanosecond integer at key and returns it
+// converted to microseconds. ok=false signals the field is absent or not an
+// integer — callers treat this as a missing required field.
+func bodyTimestampMicros(m pcommon.Map, key string) (int64, bool) {
+	v, ok := m.Get(key)
+	if !ok {
+		return 0, false
 	}
-	schema := parquet.NewSchema("logs", group)
+	if v.Type() != pcommon.ValueTypeInt {
+		return 0, false
+	}
+	return v.Int() / 1000, true
+}
 
+// bodyJSONBytes returns a JSON-encoded byte slice for the value at key.
+// Strings pass through as-is (assumed already valid JSON from BindPlane);
+// maps and slices are json.Marshal'd. Returns nil if absent or unencodable.
+func bodyJSONBytes(m pcommon.Map, key string) []byte {
+	v, ok := m.Get(key)
+	if !ok {
+		return nil
+	}
+	switch v.Type() {
+	case pcommon.ValueTypeStr:
+		return []byte(v.Str())
+	case pcommon.ValueTypeBytes:
+		return v.Bytes().AsRaw()
+	case pcommon.ValueTypeMap, pcommon.ValueTypeSlice:
+		b, err := json.Marshal(v.AsRaw())
+		if err != nil {
+			return nil
+		}
+		return b
+	default:
+		return nil
+	}
+}
+
+// writeParquet encodes records as a Parquet file using the fixed schema.
+func writeParquet(records []record) ([]byte, error) {
 	var buf bytes.Buffer
-	writer := parquet.NewWriter(&buf, schema,
+	writer := parquet.NewWriter(&buf, fixedSchema,
 		parquet.Compression(&snappy.Codec{}),
 		parquet.MaxRowsPerRowGroup(10_000),
 	)
 
-	for _, record := range records {
-		row := make(parquet.Row, len(keys))
-		for i, k := range keys {
-			if v, ok := record[k]; ok {
-				// definition level 1 = value present; repetition level 0 = non-repeated
-				row[i] = typedParquetValue(v, colTypes[k]).Level(0, 1, i)
-			} else {
-				// definition level 0 = null
-				row[i] = parquet.NullValue().Level(0, 0, i)
-			}
-		}
-		if _, err := writer.WriteRows([]parquet.Row{row}); err != nil {
+	for _, r := range records {
+		if _, err := writer.WriteRows([]parquet.Row{recordToRow(r)}); err != nil {
 			return nil, fmt.Errorf("write row: %w", err)
 		}
 	}
@@ -317,30 +385,47 @@ func writeParquet(records []map[string]typedValue, keys []string, colTypes map[s
 	return buf.Bytes(), nil
 }
 
-func parquetNode(ct columnType) parquet.Node {
-	switch ct {
-	case colInt64:
-		return parquet.Int(64)
-	case colDouble:
-		return parquet.Leaf(parquet.DoubleType)
-	case colBool:
-		return parquet.Leaf(parquet.BooleanType)
-	default:
-		return parquet.String()
-	}
+// recordToRow builds a parquet.Row in the column order produced by
+// parquet.Group.Fields() (alphabetical). Required fields use definition
+// level 0 (the only valid level for required leaves); optional fields use
+// definition level 1 when present and 0 when null.
+func recordToRow(r record) parquet.Row {
+	row := make(parquet.Row, numColumns)
+	row[idxAppname] = optString(r.appname, idxAppname)
+	row[idxCollector] = optString(r.collector, idxCollector)
+	row[idxEventDetailsJSON] = optBytes(r.eventDetailsJSON, idxEventDetailsJSON)
+	row[idxEventMessage] = optString(r.eventMessage, idxEventMessage)
+	row[idxEventTs] = parquet.Int64Value(r.eventTsMicros).Level(0, 0, idxEventTs)
+	row[idxFacility] = optInt(r.facility, idxFacility)
+	row[idxHostname] = optString(r.hostname, idxHostname)
+	row[idxLogType] = optString(r.logType, idxLogType)
+	row[idxNamespace] = optString(r.namespace, idxNamespace)
+	row[idxParseStatus] = optString(r.parseStatus, idxParseStatus)
+	row[idxRcvdTs] = parquet.Int64Value(r.rcvdTsMicros).Level(0, 0, idxRcvdTs)
+	row[idxSeverity] = optInt(r.severity, idxSeverity)
+	row[idxSourceIP] = optString(r.sourceIP, idxSourceIP)
+	return row
 }
 
-func typedParquetValue(v typedValue, ct columnType) parquet.Value {
-	switch ct {
-	case colInt64:
-		return parquet.Int64Value(v.i64)
-	case colDouble:
-		return parquet.DoubleValue(v.f64)
-	case colBool:
-		return parquet.BooleanValue(v.b)
-	default:
-		return parquet.ValueOf(v.str)
+func optString(p *string, idx int) parquet.Value {
+	if p == nil {
+		return parquet.NullValue().Level(0, 0, idx)
 	}
+	return parquet.ByteArrayValue([]byte(*p)).Level(0, 1, idx)
+}
+
+func optInt(p *int64, idx int) parquet.Value {
+	if p == nil {
+		return parquet.NullValue().Level(0, 0, idx)
+	}
+	return parquet.Int64Value(*p).Level(0, 1, idx)
+}
+
+func optBytes(b []byte, idx int) parquet.Value {
+	if b == nil {
+		return parquet.NullValue().Level(0, 0, idx)
+	}
+	return parquet.ByteArrayValue(b).Level(0, 1, idx)
 }
 
 // objectPath builds the GCS object path:

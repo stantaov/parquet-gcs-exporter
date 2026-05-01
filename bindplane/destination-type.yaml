@@ -5,9 +5,14 @@ metadata:
   displayName: Parquet GCS Storage
   icon: /icons/sources/google-cloud.svg
   description: >
-    Exports logs as Parquet files to Google Cloud Storage.
-    Each field in the log body becomes a Parquet column, partitioned by time.
-    Files are written on a configurable batch size or timeout, whichever comes first.
+    Exports logs as Parquet files to Google Cloud Storage using a fixed
+    BigQuery-aligned schema (rcvd_ts, event_ts, collector, namespace, log_type,
+    source_ip, hostname, appname, facility, severity, event_message,
+    event_details_json, parse_status). The body map produced by upstream
+    BindPlane processors is projected onto this schema; extra fields are
+    dropped, and records missing rcvd_ts or event_ts are skipped.
+    Files are partitioned by time and written on a configurable batch size or
+    timeout, whichever comes first.
 spec:
   version: 1.0.1
   parameters:

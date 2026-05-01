@@ -2,12 +2,12 @@
 
 An OpenTelemetry Collector exporter that writes log data as Apache Parquet files to Google Cloud Storage (GCS).
 
-Each field in the log body becomes a Parquet column. Files are time-partitioned using Hive-style paths (e.g., `year=2006/month=01/day=02/hour=15`) for efficient querying with BigQuery external tables.
+The exporter uses a **fixed BigQuery-aligned schema**: each log record's body map (produced by upstream BindPlane processors) is projected onto 13 columns (`rcvd_ts`, `event_ts`, `collector`, `namespace`, `log_type`, `source_ip`, `hostname`, `appname`, `facility`, `severity`, `event_message`, `event_details_json`, `parse_status`). Files are time-partitioned using Hive-style paths (e.g., `year=2006/month=01/day=02/hour=15`) for efficient querying with BigQuery external tables.
 
 ## Features
 
-- **Dynamic schema** — Parquet columns are inferred from log body fields at write time; no fixed schema required
-- **Type-aware columns** — Preserves original value types (Int64, Double, Bool, String); mixed types for the same key fall back to String
+- **Fixed BQ-aligned schema** — Records are projected onto a 13-column schema that matches the destination BigQuery table 1:1; extra body fields are dropped, records missing the required `rcvd_ts`/`event_ts` are skipped
+- **Native BQ types** — Timestamps encoded as INT64 `TIMESTAMP(MICROS, UTC)`; `event_details_json` encoded with the Parquet `JSON` logical type, both loadable into BigQuery TIMESTAMP/JSON columns without conversion
 - **Time-based partitioning** — Configurable granularity (day, hour, minute) using Hive-style directory layout
 - **Snappy compression** — Parquet files use Snappy codec for balanced compression and read performance
 - **Retry with backoff** — Exponential back-off on failed GCS uploads
@@ -21,10 +21,9 @@ Each field in the log body becomes a Parquet column. Files are time-partitioned 
 OTel Collector Pipeline
   └─ Logs
        └─ parquetgcsstorage exporter
-            ├─ Extract body maps from log records
-            ├─ Build dynamic Parquet schema (union of all keys)
-            ├─ Infer column types (Int64, Double, Bool, String)
-            ├─ Encode as Parquet (Snappy, nullable typed columns)
+            ├─ Project body maps onto fixed 13-column schema
+            ├─ Skip records with non-map bodies or missing rcvd_ts/event_ts
+            ├─ Encode as Parquet (Snappy, TIMESTAMP_MICROS, JSON logical type)
             └─ Upload to GCS: gs://{bucket}/{prefix}/{partition}/{uuid}.parquet
 ```
 
@@ -62,9 +61,8 @@ go test -v -run TestWriteParquet_RoundTrip ./...
 ```
 
 The test suite covers:
-- **extractBodyMaps** — typed value extraction, non-map body skipping, multi-resource/scope traversal
-- **inferSchema** — consistent types, mixed-type fallback to string, sorted key ordering
-- **writeParquet** — round-trip encode/decode, nullable columns, all column types, mixed-type fallback
+- **extractRecords** — full-record happy path, non-map body skipping, missing-required-timestamp skipping, optional-field absence, extra-field dropping, JSON-as-map fallback
+- **writeParquet** — round-trip encode/decode and schema column verification, empty input
 - **objectPath** — prefix handling, empty prefix, trailing slash, hourly partitioning
 - **Config.Validate** — required field validation
 
@@ -155,6 +153,28 @@ gs://{bucket}/
 ```
 
 This Hive-style layout enables BigQuery partition pruning on external tables, significantly reducing query costs and latency.
+
+## BigQuery Schema
+
+The destination BQ table that matches the Parquet output:
+
+```sql
+CREATE TABLE `project.dataset.logs` (
+  rcvd_ts            TIMESTAMP NOT NULL OPTIONS(description="Timestamp of the relay agent that received the event."),
+  event_ts           TIMESTAMP NOT NULL OPTIONS(description="Identified SYSLOG TIMESTAMP if known, otherwise rcvd_ts."),
+  collector          STRING             OPTIONS(description="Name of the asset that received the logs (relay host or BindPlane agent)."),
+  namespace          STRING             OPTIONS(description="Business group / data owner. Aligned to SecOps namespace."),
+  log_type           STRING             OPTIONS(description="Derived message type aligned to SecOps Log Types where possible."),
+  source_ip          STRING             OPTIONS(description="IP address of the sending device as interpreted by the relay agent."),
+  hostname           STRING             OPTIONS(description="Identified SYSLOG HOSTNAME value."),
+  appname            STRING             OPTIONS(description="Identified SYSLOG APP-NAME value."),
+  facility           INTEGER            OPTIONS(description="Identified SYSLOG PRI facility value."),
+  severity           INTEGER            OPTIONS(description="Identified SYSLOG SEVERITY value."),
+  event_message      STRING             OPTIONS(description="Raw log event message as received by the collector."),
+  event_details_json JSON               OPTIONS(description="Log-type-specific extracted fields as JSON."),
+  parse_status       STRING             OPTIONS(description="Parser outcome: 'parsed' or 'unparsed'.")
+);
+```
 
 ## BigQuery External Table
 
